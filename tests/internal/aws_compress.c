@@ -334,6 +334,107 @@ void test_b64_truncated_gzip_boundary()
     flb_aws_compress_truncate_b64_test_cases__gzip_decode(cases, 40);
 }
 
+#ifdef FLB_HAVE_ARROW_PARQUET
+void test_parquet_format_snappy()
+{
+    int ret;
+    void *out_buf = NULL;
+    size_t out_size = 0;
+    char *json = "{\"key\":\"value\",\"num\":42}\n"
+                 "{\"key\":\"other\",\"num\":99}\n";
+    size_t json_len = strlen(json);
+
+    ret = out_s3_compress_parquet(json, json_len, &out_buf, &out_size,
+                                 FLB_PARQUET_COMPRESSION_SNAPPY);
+    TEST_CHECK(ret == 0);
+    TEST_CHECK(out_size > 8);
+    TEST_CHECK(memcmp(out_buf, "PAR1", 4) == 0);
+    TEST_CHECK(memcmp((char *)out_buf + out_size - 4, "PAR1", 4) == 0);
+    flb_free(out_buf);
+}
+
+void test_parquet_format_zstd()
+{
+    int ret;
+    void *out_buf = NULL;
+    size_t out_size = 0;
+    char *json = "{\"key\":\"value\",\"num\":42}\n"
+                 "{\"key\":\"other\",\"num\":99}\n";
+    size_t json_len = strlen(json);
+
+    ret = out_s3_compress_parquet(json, json_len, &out_buf, &out_size,
+                                 FLB_PARQUET_COMPRESSION_ZSTD);
+    TEST_CHECK(ret == 0);
+    TEST_CHECK(out_size > 8);
+    TEST_CHECK(memcmp(out_buf, "PAR1", 4) == 0);
+    TEST_CHECK(memcmp((char *)out_buf + out_size - 4, "PAR1", 4) == 0);
+    flb_free(out_buf);
+}
+
+void test_parquet_format_gzip()
+{
+    int ret;
+    void *out_buf = NULL;
+    size_t out_size = 0;
+    char *json = "{\"key\":\"value\",\"num\":42}\n"
+                 "{\"key\":\"other\",\"num\":99}\n";
+    size_t json_len = strlen(json);
+
+    ret = out_s3_compress_parquet(json, json_len, &out_buf, &out_size,
+                                 FLB_PARQUET_COMPRESSION_GZIP);
+    TEST_CHECK(ret == 0);
+    TEST_CHECK(out_size > 8);
+    TEST_CHECK(memcmp(out_buf, "PAR1", 4) == 0);
+    TEST_CHECK(memcmp((char *)out_buf + out_size - 4, "PAR1", 4) == 0);
+    flb_free(out_buf);
+}
+
+void test_parquet_format_uncompressed()
+{
+    int ret;
+    void *out_buf = NULL;
+    size_t out_size = 0;
+    char *json = "{\"key\":\"value\",\"num\":42}\n"
+                 "{\"key\":\"other\",\"num\":99}\n";
+    size_t json_len = strlen(json);
+
+    ret = out_s3_compress_parquet(json, json_len, &out_buf, &out_size,
+                                 FLB_PARQUET_COMPRESSION_NONE);
+    TEST_CHECK(ret == 0);
+    TEST_CHECK(out_size > 8);
+    TEST_CHECK(memcmp(out_buf, "PAR1", 4) == 0);
+    TEST_CHECK(memcmp((char *)out_buf + out_size - 4, "PAR1", 4) == 0);
+    flb_free(out_buf);
+}
+
+void test_parquet_compression_reduces_size()
+{
+    int ret;
+    void *buf_none = NULL;
+    void *buf_snappy = NULL;
+    size_t size_none = 0;
+    size_t size_snappy = 0;
+    char *json = "{\"msg\":\"hello hello hello hello hello hello\"}\n"
+                 "{\"msg\":\"hello hello hello hello hello hello\"}\n"
+                 "{\"msg\":\"hello hello hello hello hello hello\"}\n"
+                 "{\"msg\":\"hello hello hello hello hello hello\"}\n"
+                 "{\"msg\":\"hello hello hello hello hello hello\"}\n";
+    size_t json_len = strlen(json);
+
+    ret = out_s3_compress_parquet(json, json_len, &buf_none, &size_none,
+                                 FLB_PARQUET_COMPRESSION_NONE);
+    TEST_CHECK(ret == 0);
+
+    ret = out_s3_compress_parquet(json, json_len, &buf_snappy, &size_snappy,
+                                 FLB_PARQUET_COMPRESSION_SNAPPY);
+    TEST_CHECK(ret == 0);
+    TEST_CHECK(size_snappy <= size_none);
+
+    flb_free(buf_none);
+    flb_free(buf_snappy);
+}
+#endif
+
 TEST_LIST = {
     { "test_compression_gzip", test_compression_gzip },
     { "test_compression_zstd", test_compression_zstd },
@@ -352,6 +453,14 @@ TEST_LIST = {
       test_b64_truncated_gzip_truncation_multi_rounds },
     { "test_b64_truncated_gzip_boundary",
       test_b64_truncated_gzip_boundary },
+#ifdef FLB_HAVE_ARROW_PARQUET
+    { "test_parquet_format_snappy", test_parquet_format_snappy },
+    { "test_parquet_format_zstd", test_parquet_format_zstd },
+    { "test_parquet_format_gzip", test_parquet_format_gzip },
+    { "test_parquet_format_uncompressed", test_parquet_format_uncompressed },
+    { "test_parquet_compression_reduces_size",
+      test_parquet_compression_reduces_size },
+#endif
     { 0 }
 };
 
