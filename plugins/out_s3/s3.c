@@ -42,6 +42,7 @@
 
 #include "s3.h"
 #include "s3_store.h"
+#include <fluent-bit/aws/flb_aws_compress.h>
 
 #define DEFAULT_S3_PORT 443
 #define DEFAULT_S3_INSECURE_PORT 80
@@ -88,6 +89,41 @@ static int blob_initialize_authorization_endpoint_upstream(struct flb_s3 *contex
 static flb_sds_t s3_format_event_chunk(struct flb_s3 *ctx,
                                        struct flb_event_chunk *event_chunk,
                                        struct flb_config *config);
+
+static int enable_parquet_format(struct flb_s3 *ctx)
+{
+#ifdef FLB_HAVE_ARROW_PARQUET
+    ctx->s3_format = FLB_S3_FORMAT_PARQUET;
+    ctx->use_put_object = FLB_TRUE;
+    return 0;
+#else
+    flb_plg_error(ctx->ins,
+                  "parquet format requires parquet-glib at compile time");
+    return -1;
+#endif
+}
+
+static int parse_output_format(const char *format)
+{
+    if (strcasecmp(format, "parquet") == 0) {
+        return FLB_S3_FORMAT_PARQUET;
+    }
+    return flb_pack_to_json_format_type(format);
+}
+
+static int map_to_parquet_codec(int compression_type)
+{
+    switch (compression_type) {
+    case FLB_AWS_COMPRESS_SNAPPY:
+        return FLB_PARQUET_COMPRESSION_SNAPPY;
+    case FLB_AWS_COMPRESS_ZSTD:
+        return FLB_PARQUET_COMPRESSION_ZSTD;
+    case FLB_AWS_COMPRESS_GZIP:
+        return FLB_PARQUET_COMPRESSION_GZIP;
+    default:
+        return FLB_PARQUET_COMPRESSION_NONE;
+    }
+}
 
 static struct flb_aws_header *get_content_encoding_header(int compression_type)
 {
@@ -655,6 +691,8 @@ static int cb_s3_init(struct flb_output_instance *ins,
     ctx->retry_time = 0;
     ctx->upload_queue_success = FLB_FALSE;
     ctx->out_format = FLB_PACK_JSON_FORMAT_LINES;
+    ctx->s3_format = FLB_S3_FORMAT_JSON_LINES;
+    ctx->parquet_compression = FLB_PARQUET_COMPRESSION_NONE;
 
     /*
      * The engine default retry_limit (1) is too low for S3's internal
@@ -693,30 +731,37 @@ static int cb_s3_init(struct flb_output_instance *ins,
     /* Format key */
     tmp = flb_output_get_property("format", ins);
     if (tmp) {
-        ret = flb_pack_to_json_format_type(tmp);
+        ret = parse_output_format(tmp);
         if (ret == -1) {
             flb_plg_error(ctx->ins, "invalid format '%s'", tmp);
             return -1;
         }
 
-        if (ret == FLB_PACK_JSON_FORMAT_JSON) {
+        if (ret == FLB_S3_FORMAT_PARQUET) {
+            if (enable_parquet_format(ctx) == -1) {
+                return -1;
+            }
+        }
+        else if (ret == FLB_PACK_JSON_FORMAT_JSON) {
             flb_plg_warn(ctx->ins,
-                         "'json' format is implicitly interpreted as 'json_lines' before."
-                         "Now interpreted as 'json_lines' explicitly now");
-            ret =  FLB_PACK_JSON_FORMAT_LINES;
+                         "'json' format is implicitly interpreted as "
+                         "'json_lines'. Now interpreted as 'json_lines' "
+                         "explicitly");
+            ctx->out_format = FLB_PACK_JSON_FORMAT_LINES;
         }
-        else if (ret != FLB_PACK_JSON_FORMAT_LINES &&
-            ret != FLB_PACK_JSON_FORMAT_OTLP) {
-            flb_plg_error(ctx->ins, "unsupported format '%s'", tmp);
-            return -1;
-        }
-        ctx->out_format = ret;
+        else if (ret == FLB_PACK_JSON_FORMAT_LINES ||
+                 ret == FLB_PACK_JSON_FORMAT_OTLP) {
+            ctx->out_format = ret;
 
-        if (ctx->out_format == FLB_PACK_JSON_FORMAT_OTLP &&
-            ctx->log_key != NULL) {
-            flb_plg_error(ctx->ins,
-                          "'log_key' is not supported when format is "
-                          "otlp_json or otlp_json_pretty");
+            if (ret == FLB_PACK_JSON_FORMAT_OTLP && ctx->log_key != NULL) {
+                flb_plg_error(ctx->ins,
+                              "'log_key' is not supported when format is "
+                              "otlp_json or otlp_json_pretty");
+                return -1;
+            }
+        }
+        else {
+            flb_plg_error(ctx->ins, "unsupported format '%s'", tmp);
             return -1;
         }
     }
@@ -805,19 +850,35 @@ static int cb_s3_init(struct flb_output_instance *ins,
 
     tmp = flb_output_get_property("compression", ins);
     if (tmp) {
-        ret = flb_aws_compression_get_type(tmp);
-        if (ret == -1) {
-            flb_plg_error(ctx->ins, "unknown compression: %s", tmp);
-            return -1;
+        if (strcasecmp(tmp, "parquet") == 0) {
+            flb_plg_warn(ctx->ins,
+                         "'compression=parquet' is deprecated. "
+                         "Use 'format parquet' with 'compression' set to "
+                         "the desired page-level codec (snappy, zstd, gzip)");
+            if (enable_parquet_format(ctx) == -1) {
+                return -1;
+            }
         }
-        if (ctx->use_put_object == FLB_FALSE &&
-            (ret == FLB_AWS_COMPRESS_ARROW ||
-             ret == FLB_AWS_COMPRESS_PARQUET)) {
-            flb_plg_error(ctx->ins,
-                          "use_put_object must be enabled when Apache Arrow or Parquet is enabled");
-            return -1;
+        else {
+            ret = flb_aws_compression_get_type(tmp);
+            if (ret == -1) {
+                flb_plg_error(ctx->ins, "unknown compression: %s", tmp);
+                return -1;
+            }
+            if (ctx->use_put_object == FLB_FALSE &&
+                ret == FLB_AWS_COMPRESS_ARROW) {
+                flb_plg_error(ctx->ins,
+                              "use_put_object must be enabled when "
+                              "Apache Arrow is enabled");
+                return -1;
+            }
+            ctx->compression = ret;
+
+            if (ctx->s3_format == FLB_S3_FORMAT_PARQUET) {
+                ctx->parquet_compression = map_to_parquet_codec(ret);
+                ctx->compression = FLB_AWS_COMPRESS_NONE;
+            }
         }
-        ctx->compression = ret;
     }
 
     tmp = flb_output_get_property("content_type", ins);
@@ -1252,9 +1313,28 @@ static int upload_data(struct flb_s3 *ctx, struct s3_file *chunk,
         file_first_log_time = chunk->first_log_time;
     }
 
+#ifdef FLB_HAVE_ARROW_PARQUET
+    if (ctx->s3_format == FLB_S3_FORMAT_PARQUET) {
+        ret = out_s3_compress_parquet(body, body_size, &payload_buf,
+                                     &payload_size,
+                                     ctx->parquet_compression);
+        if (ret == -1) {
+            flb_plg_error(ctx->ins, "Failed to convert data to Parquet");
+            if (chunk != NULL) {
+                s3_store_file_unlock(chunk);
+                chunk->failures += 1;
+            }
+            return FLB_RETRY;
+        }
+        preCompress_size = body_size;
+        body = (void *) payload_buf;
+        body_size = payload_size;
+    }
+    else
+#endif
     if (ctx->compression != FLB_AWS_COMPRESS_NONE) {
-        /* Map payload */
-        ret = flb_aws_compression_compress(ctx->compression, body, body_size, &payload_buf, &payload_size);
+        ret = flb_aws_compression_compress(ctx->compression, body, body_size,
+                                           &payload_buf, &payload_size);
         if (ret == -1) {
             flb_plg_error(ctx->ins, "Failed to compress data");
             if (chunk != NULL) {
@@ -1478,15 +1558,40 @@ static int put_all_chunks(struct flb_s3 *ctx)
                 return -1;
             }
 
-            if (ctx->compression != FLB_AWS_COMPRESS_NONE) {
-                /* Map payload */
-                ret = flb_aws_compression_compress(ctx->compression, buffer, buffer_size, &payload_buf, &payload_size);
+#ifdef FLB_HAVE_ARROW_PARQUET
+            if (ctx->s3_format == FLB_S3_FORMAT_PARQUET) {
+                ret = out_s3_compress_parquet(buffer, buffer_size,
+                                             &payload_buf, &payload_size,
+                                             ctx->parquet_compression);
                 if (ret == -1) {
-                    flb_plg_error(ctx->ins, "Failed to compress data, uploading uncompressed data instead to prevent data loss");
-                } else {
-                    flb_plg_info(ctx->ins, "Pre-compression chunk size is %zu, After compression, chunk is %zu bytes", buffer_size, payload_size);
+                    flb_plg_error(ctx->ins,
+                                  "Failed to convert to Parquet, uploading "
+                                  "raw data to prevent data loss");
+                }
+                else {
                     flb_free(buffer);
-
+                    buffer = (void *) payload_buf;
+                    buffer_size = payload_size;
+                }
+            }
+            else
+#endif
+            if (ctx->compression != FLB_AWS_COMPRESS_NONE) {
+                ret = flb_aws_compression_compress(ctx->compression,
+                                                  buffer, buffer_size,
+                                                  &payload_buf,
+                                                  &payload_size);
+                if (ret == -1) {
+                    flb_plg_error(ctx->ins,
+                                  "Failed to compress data, uploading "
+                                  "uncompressed data to prevent data loss");
+                }
+                else {
+                    flb_plg_info(ctx->ins,
+                                 "Pre-compression chunk size is %zu, "
+                                 "After compression, chunk is %zu bytes",
+                                 buffer_size, payload_size);
+                    flb_free(buffer);
                     buffer = (void *) payload_buf;
                     buffer_size = payload_size;
                 }
@@ -4076,7 +4181,9 @@ static struct flb_config_map config_map[] = {
     {
      FLB_CONFIG_MAP_STR, "format", "json_lines",
      0, FLB_FALSE, 0,
-     "Set record output format. Supported values are json_lines, and otlp_json."
+     "Set output format. Supported values: json_lines, otlp_json, parquet. "
+     "When format is parquet, the 'compression' option controls the page-level "
+     "codec inside the Parquet file (snappy, zstd, gzip). Default: uncompressed."
     },
     {
      FLB_CONFIG_MAP_STR, "json_date_format", NULL,
@@ -4147,12 +4254,10 @@ static struct flb_config_map config_map[] = {
     {
      FLB_CONFIG_MAP_STR, "compression", NULL,
      0, FLB_FALSE, 0,
-    "Compression type for S3 objects. Supported values: 'gzip', 'zstd', 'snappy'. "
-    "'arrow' and 'parquet' are also available if Apache Arrow was enabled at compile time. "
-    "Defaults to no compression. "
-    "If 'gzip' is selected, the Content-Encoding HTTP Header will be set to 'gzip'. "
-    "If 'zstd' is selected, the Content-Encoding HTTP Header will be set to 'zstd'. "
-    "If 'snappy' is selected, the Content-Encoding HTTP Header will be set to 'snappy'."
+    "Compression type for S3 objects. Supported values: 'gzip', 'zstd', 'snappy', "
+    "'arrow'. When format is 'parquet', this sets the page-level codec inside the "
+    "Parquet file. 'compression=parquet' is deprecated; use 'format parquet' instead. "
+    "Defaults to no compression."
     },
     {
      FLB_CONFIG_MAP_STR, "content_type", NULL,
