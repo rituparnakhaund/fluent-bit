@@ -28,6 +28,12 @@
 #define FLB_AWS_COMPRESS_ZSTD    4
 #define FLB_AWS_COMPRESS_SNAPPY  5
 
+/* Parquet page-level compression codecs */
+#define FLB_PARQUET_COMPRESSION_NONE    0
+#define FLB_PARQUET_COMPRESSION_SNAPPY  1
+#define FLB_PARQUET_COMPRESSION_GZIP    2
+#define FLB_PARQUET_COMPRESSION_ZSTD    3
+
 /*
  * Get compression type from compression keyword. The return value is used to identify
  * what compression option to utilize.

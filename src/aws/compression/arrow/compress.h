@@ -21,8 +21,12 @@ int out_s3_compress_arrow(void *json, size_t size, void **out_buf, size_t *out_s
  * `size` is the length of the json data (excluding the trailing
  * null-terminator character).
  *
+ * `parquet_compression` specifies the page-level codec to use
+ * (FLB_PARQUET_COMPRESSION_*).
+ *
  * Return 0 on success (with `out_buf` and `out_size` updated),
  * and -1 on failure
  */
-int out_s3_compress_parquet(void *json, size_t size, void **out_buf, size_t *out_size);
+int out_s3_compress_parquet(void *json, size_t size, void **out_buf,
+                            size_t *out_size, int parquet_compression);
 #endif
